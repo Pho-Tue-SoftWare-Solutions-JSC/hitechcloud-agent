@@ -1,0 +1,266 @@
+package service
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Pho-Tue-SoftWare-Solutions-JSC/hitechcloud-agent/app/dto"
+	"github.com/Pho-Tue-SoftWare-Solutions-JSC/hitechcloud-agent/app/model"
+	"github.com/Pho-Tue-SoftWare-Solutions-JSC/hitechcloud-agent/app/repo"
+	"github.com/Pho-Tue-SoftWare-Solutions-JSC/hitechcloud-agent/buserr"
+	"github.com/Pho-Tue-SoftWare-Solutions-JSC/hitechcloud-agent/constant"
+	"github.com/Pho-Tue-SoftWare-Solutions-JSC/hitechcloud-agent/utils/encrypt"
+	"github.com/Pho-Tue-SoftWare-Solutions-JSC/hitechcloud-agent/utils/ssh"
+	terminalai "github.com/Pho-Tue-SoftWare-Solutions-JSC/hitechcloud-agent/utils/terminal/ai"
+	"github.com/jinzhu/copier"
+)
+
+type SettingService struct{}
+
+type ISettingService interface {
+	GetSettingInfo() (*dto.SettingInfo, error)
+	GetTerminalAIInfo() (*dto.TerminalAIInfo, error)
+	Update(key, value string) error
+	UpdateTerminalAI(req dto.TerminalAIInfo) error
+
+	TestConnByInfo(req dto.SSHConnData) bool
+	SaveConnInfo(req dto.SSHConnData) error
+	SetDefaultIsConn(req dto.SSHDefaultConn) error
+	GetSystemProxy() (*dto.SystemProxy, error)
+	GetLocalConn() dto.SSHConnData
+	GetSettingByKey(key string) string
+
+	SaveDescription(req dto.CommonDescription) error
+}
+
+func NewISettingService() ISettingService {
+	return &SettingService{}
+}
+
+func (u *SettingService) GetSettingInfo() (*dto.SettingInfo, error) {
+	setting, err := settingRepo.GetList()
+	if err != nil {
+		return nil, buserr.New("ErrRecordNotFound")
+	}
+	settingMap := make(map[string]string)
+	for _, set := range setting {
+		settingMap[set.Key] = set.Value
+	}
+	var info dto.SettingInfo
+	arr, err := json.Marshal(settingMap)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(arr, &info); err != nil {
+		return nil, err
+	}
+
+	info.LocalTime = time.Now().Format("2006-01-02 15:04:05 MST -0700")
+	return &info, err
+}
+
+func (u *SettingService) GetTerminalAIInfo() (*dto.TerminalAIInfo, error) {
+	info := &dto.TerminalAIInfo{
+		AIStatus:              constant.StatusDisable,
+		AIAccountID:           "",
+		AIPrefix:              constant.DefaultTerminalAIPrefix,
+		AIRiskCommands:        "[]",
+		AIRiskCommandsDefault: constant.DefaultTerminalAIRiskCommands,
+	}
+
+	if value, err := settingRepo.GetValueByKey("AIStatus"); err == nil && value != "" {
+		info.AIStatus = value
+	}
+	if value, err := settingRepo.GetValueByKey("AIAccountID"); err == nil {
+		info.AIAccountID = value
+	}
+	if value, err := settingRepo.GetValueByKey("AIPrefix"); err == nil {
+		info.AIPrefix = value
+	}
+	if value, err := settingRepo.GetValueByKey("AIRiskCommands"); err == nil && value != "" {
+		info.AIRiskCommands = value
+	}
+
+	return info, nil
+}
+
+func (u *SettingService) Update(key, value string) error {
+	return settingRepo.UpdateOrCreate(key, value)
+}
+
+func (u *SettingService) UpdateTerminalAI(req dto.TerminalAIInfo) error {
+	if strings.EqualFold(strings.TrimSpace(req.AIStatus), constant.StatusEnable) {
+		accountID, err := strconv.ParseUint(strings.TrimSpace(req.AIAccountID), 10, 64)
+		if err != nil || accountID == 0 {
+			return buserr.New("ErrAgentAccountIDRequired")
+		}
+		currentStatus, _ := settingRepo.GetValueByKey("AIStatus")
+		currentAccountID, _ := settingRepo.GetValueByKey("AIAccountID")
+		needValidate := !strings.EqualFold(strings.TrimSpace(currentStatus), constant.StatusEnable) ||
+			strings.TrimSpace(currentAccountID) != strings.TrimSpace(req.AIAccountID)
+		if needValidate {
+			if err := terminalai.ValidateTerminalAccount(uint(accountID)); err != nil {
+				return buserr.WithErr("ErrAgentAccountUnavailable", err)
+			}
+		}
+	}
+	if err := settingRepo.UpdateOrCreate("AIStatus", req.AIStatus); err != nil {
+		return err
+	}
+	if err := settingRepo.UpdateOrCreate("AIAccountID", req.AIAccountID); err != nil {
+		return err
+	}
+	if err := settingRepo.UpdateOrCreate("AIPrefix", req.AIPrefix); err != nil {
+		return err
+	}
+	return settingRepo.UpdateOrCreate("AIRiskCommands", req.AIRiskCommands)
+}
+
+func (u *SettingService) TestConnByInfo(req dto.SSHConnData) bool {
+	if req.AuthMode == "password" && len(req.Password) != 0 {
+		password, err := base64.StdEncoding.DecodeString(req.Password)
+		if err != nil {
+			return false
+		}
+		req.Password = string(password)
+	}
+	if req.AuthMode == "key" && len(req.PrivateKey) != 0 {
+		privateKey, err := base64.StdEncoding.DecodeString(req.PrivateKey)
+		if err != nil {
+			return false
+		}
+		req.PrivateKey = string(privateKey)
+	}
+
+	var connInfo ssh.ConnInfo
+	_ = copier.Copy(&connInfo, &req)
+	connInfo.PrivateKey = []byte(req.PrivateKey)
+	if len(req.PassPhrase) != 0 {
+		connInfo.PassPhrase = []byte(req.PassPhrase)
+	}
+	client, err := ssh.NewClient(connInfo)
+	if err != nil {
+		return false
+	}
+	defer client.Close()
+	return true
+}
+
+func (u *SettingService) SaveConnInfo(req dto.SSHConnData) error {
+	if req.AuthMode == "password" && len(req.Password) != 0 {
+		password, err := base64.StdEncoding.DecodeString(req.Password)
+		if err != nil {
+			return err
+		}
+		req.Password = string(password)
+	}
+	if req.AuthMode == "key" && len(req.PrivateKey) != 0 {
+		privateKey, err := base64.StdEncoding.DecodeString(req.PrivateKey)
+		if err != nil {
+			return err
+		}
+		req.PrivateKey = string(privateKey)
+	}
+
+	var connInfo ssh.ConnInfo
+	_ = copier.Copy(&connInfo, &req)
+	connInfo.PrivateKey = []byte(req.PrivateKey)
+	if len(req.PassPhrase) != 0 {
+		connInfo.PassPhrase = []byte(req.PassPhrase)
+	}
+	client, err := ssh.NewClient(connInfo)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	var connItem model.LocalConnInfo
+	_ = copier.Copy(&connItem, &req)
+	localConn, _ := json.Marshal(&connItem)
+	connAfterEncrypt, _ := encrypt.StringEncrypt(string(localConn))
+	_ = settingRepo.Update("LocalSSHConn", connAfterEncrypt)
+	return nil
+}
+
+func (u *SettingService) SetDefaultIsConn(req dto.SSHDefaultConn) error {
+	if req.DefaultConn == constant.StatusDisable && req.WithReset {
+		if err := settingRepo.Update("LocalSSHConn", ""); err != nil {
+			return err
+		}
+	}
+	return settingRepo.Update("LocalSSHConnShow", req.DefaultConn)
+}
+
+func (u *SettingService) GetSystemProxy() (*dto.SystemProxy, error) {
+	systemProxy := dto.SystemProxy{}
+	systemProxy.Type, _ = settingRepo.GetValueByKey("ProxyType")
+	systemProxy.URL, _ = settingRepo.GetValueByKey("ProxyUrl")
+	systemProxy.Port, _ = settingRepo.GetValueByKey("ProxyPort")
+	systemProxy.User, _ = settingRepo.GetValueByKey("ProxyUser")
+	passwd, _ := settingRepo.GetValueByKey("ProxyPasswd")
+	systemProxy.Password, _ = encrypt.StringDecrypt(passwd)
+	return &systemProxy, nil
+}
+
+func (u *SettingService) GetLocalConn() dto.SSHConnData {
+	var data dto.SSHConnData
+	data.LocalSSHConnShow, _ = settingRepo.GetValueByKey("LocalSSHConnShow")
+	connItem, _ := settingRepo.GetValueByKey("LocalSSHConn")
+	if len(connItem) == 0 {
+		return data
+	}
+	connInfoInDB, _ := encrypt.StringDecrypt(connItem)
+	data.LocalSSHConnShow, _ = settingRepo.GetValueByKey("LocalSSHConnShow")
+	if err := json.Unmarshal([]byte(connInfoInDB), &data); err != nil {
+		return data
+	}
+	if len(data.Password) != 0 {
+		data.Password = base64.StdEncoding.EncodeToString([]byte(data.Password))
+	}
+	if len(data.PrivateKey) != 0 {
+		data.PrivateKey = base64.StdEncoding.EncodeToString([]byte(data.PrivateKey))
+	}
+	if len(data.PassPhrase) != 0 {
+		data.PassPhrase = base64.StdEncoding.EncodeToString([]byte(data.PassPhrase))
+	}
+	return data
+}
+
+func (u *SettingService) GetSettingByKey(key string) string {
+	switch key {
+	case "LocalSSHConn":
+		value, _ := settingRepo.GetValueByKey(key)
+		if len(value) == 0 {
+			return ""
+		}
+		itemStr, _ := encrypt.StringDecrypt(value)
+		return itemStr
+	default:
+		value, _ := settingRepo.GetValueByKey(key)
+		return value
+	}
+}
+
+func (u *SettingService) SaveDescription(req dto.CommonDescription) error {
+	if len(req.Description) == 0 && !req.IsPinned {
+		_ = settingRepo.DelDescription(req.ID)
+		return nil
+	}
+	data, _ := settingRepo.GetDescription(settingRepo.WithByDescriptionID(req.ID), repo.WithByType(req.Type), repo.WithByDetailType(req.DetailType))
+	if data.ID == "" {
+		if err := copier.Copy(&data, &req); err != nil {
+			return err
+		}
+		return settingRepo.CreateDescription(&data)
+	}
+	valMap := make(map[string]interface{})
+	valMap["type"] = req.Type
+	valMap["detail_type"] = req.DetailType
+	valMap["is_pinned"] = req.IsPinned
+	valMap["description"] = req.Description
+
+	return settingRepo.UpdateDescription(data.ID, valMap)
+}
